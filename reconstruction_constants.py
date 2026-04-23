@@ -1,0 +1,19 @@
+import os
+
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PYRAMID_FLOW_REPO = os.path.join(REPO_ROOT, "Pyramid-Flow")
+DEFAULT_VAE_MODEL_REPO = "rain1011/pyramid-flow-miniflux"
+DEFAULT_VAE_DOWNLOAD_ROOT = os.path.join(REPO_ROOT, "pyramid-flow-miniflux")
+DEFAULT_VAE_CHECKPOINT_DIRNAME = "causal_video_vae"
+DEFAULT_VAE_REQUIRED_FILE = "config.json"
+DEFAULT_VAE_CHECKPOINT = os.path.join(
+    DEFAULT_VAE_DOWNLOAD_ROOT,
+    DEFAULT_VAE_CHECKPOINT_DIRNAME,
+)
+DEFAULT_DEVICES = "cuda:0"
+DEFAULT_MAX_FRAMES = 64
+DEFAULT_PREFETCH_QUEUE_SIZE = 4
+DEFAULT_DECODE_THREADS = 8
+DEFAULT_FFMPEG_PRESET = "veryfast"
+DEFAULT_FFMPEG_THREADS = 8
