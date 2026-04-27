@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--sample-ratio", type=float, default=1.0)
     parser.add_argument("--sample-seed", type=int, default=0)
     parser.add_argument("--max-frames", type=int, default=DEFAULT_MAX_FRAMES)
-    parser.add_argument("--tile-sample-min-size", type=int, default=256)
+    parser.add_argument("--tile-sample-min-size", type=int, default=1280)
     parser.add_argument("--force-fps", type=float, default=None)
     parser.add_argument(
         "--skip-existing",

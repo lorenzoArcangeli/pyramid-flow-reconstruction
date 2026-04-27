@@ -15,50 +15,49 @@ def read_video_cpu(
     decode_threads: int = 0,
 ) -> tuple[torch.Tensor, float, int]:
     """Decode video on CPU and return a pinned-memory float32 tensor."""
-    container = av.open(video_path)
-    stream = container.streams.video[0]
-    stream.thread_type = "AUTO"
-    if decode_threads > 0:
-        stream.thread_count = decode_threads
-    fps = float(stream.average_rate) if stream.average_rate is not None else 30.0
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        if decode_threads > 0:
+            stream.thread_count = decode_threads
+        rate = stream.guessed_rate if stream.guessed_rate is not None else stream.average_rate
+        fps = float(rate) if rate is not None else 30.0
 
-    frames: list[np.ndarray] = []
-    resize_w: int | None = None
-    resize_h: int | None = None
+        frames: list[np.ndarray] = []
+        resize_w: int | None = None
+        resize_h: int | None = None
 
-    for i, frame in enumerate(container.decode(video=0)):
-        if max_frames > 0 and i >= max_frames:
-            break
-        img = frame.to_ndarray(format="rgb24")
-        h, w = img.shape[0], img.shape[1]
+        for i, frame in enumerate(container.decode(video=0)):
+            if max_frames > 0 and i >= max_frames:
+                break
+            img = frame.to_ndarray(format="rgb24")
+            h, w = img.shape[0], img.shape[1]
 
-        if target_width and target_height:
-            if w != target_width or h != target_height:
-                img = cv2.resize(
-                    img,
-                    (target_width, target_height),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-        else:
-            if resize_w is None or resize_h is None:
-                short_edge = min(h, w)
-                if short_edge > 0:
-                    scale = 640.0 / float(short_edge)
-                    resize_w = int(round(w * scale))
-                    resize_h = int(round(h * scale))
-                else:
-                    resize_w, resize_h = w, h
-
-            if resize_w is not None and resize_h is not None:
-                if w != resize_w or h != resize_h:
+            if target_width and target_height:
+                if w != target_width or h != target_height:
                     img = cv2.resize(
                         img,
-                        (resize_w, resize_h),
+                        (target_width, target_height),
                         interpolation=cv2.INTER_LINEAR,
                     )
-        frames.append(img)
+            else:
+                if resize_w is None or resize_h is None:
+                    short_edge = min(h, w)
+                    if short_edge > 0:
+                        scale = 640.0 / float(short_edge)
+                        resize_w = int(round(w * scale))
+                        resize_h = int(round(h * scale))
+                    else:
+                        resize_w, resize_h = w, h
 
-    container.close()
+                if resize_w is not None and resize_h is not None:
+                    if w != resize_w or h != resize_h:
+                        img = cv2.resize(
+                            img,
+                            (resize_w, resize_h),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+            frames.append(img)
 
     if not frames:
         raise ValueError(f"No frames decoded from {video_path}")
@@ -85,6 +84,7 @@ def compress_and_save_video(
     else:
         t = t.squeeze(0).permute(0, 2, 3, 1)
 
+    t = torch.nan_to_num(t)
     frames_np = (t.cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
     _, h, w, _ = frames_np.shape
 
@@ -93,7 +93,7 @@ def compress_and_save_video(
         frames_np = np.pad(frames_np, ((0, 0), (0, h2 - h), (0, w2 - w), (0, 0)), mode="edge")
         h, w = h2, w2
 
-    crf = int(np.random.randint(16, 31))
+    crf = 18
     ffmpeg_cmd = [
         "ffmpeg", "-y", "-v", "error",
         "-f", "rawvideo",
@@ -112,9 +112,7 @@ def compress_and_save_video(
     ]
     if ffmpeg_threads > 0:
         ffmpeg_cmd[1:1] = ["-threads", str(ffmpeg_threads)]
-    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-    proc.stdin.write(frames_np.tobytes())
-    proc.stdin.close()
-    proc.wait()
+    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    _, stderr = proc.communicate(frames_np.tobytes())
     if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed (code {proc.returncode}) for {output_path}")
+        raise RuntimeError(f"ffmpeg failed (code {proc.returncode}) for {output_path}: {stderr.decode(errors='replace')}")

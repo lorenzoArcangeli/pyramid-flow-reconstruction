@@ -1,15 +1,17 @@
 import queue
 import threading
 
-from .constants import PREFETCH_QUEUE_SIZE
 from .video_io import read_video_cpu
+
+_QUEUE_PUT_TIMEOUT = 1  # seconds; allows the shutdown event to be checked regularly
 
 
 class VideoPrefetcher:
     """Background thread that pre-loads videos to CPU pinned memory."""
 
-    def __init__(self, tasks, args, maxsize: int = PREFETCH_QUEUE_SIZE):
+    def __init__(self, tasks, args, maxsize: int = 2):
         self._q: queue.Queue = queue.Queue(maxsize=maxsize)
+        self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._load_loop, args=(tasks, args), daemon=True
         )
@@ -17,6 +19,8 @@ class VideoPrefetcher:
 
     def _load_loop(self, tasks, args):
         for task in tasks:
+            if self._stop.is_set():
+                return
             try:
                 tensor, fps, nf = read_video_cpu(
                     task.input_path,
@@ -25,10 +29,30 @@ class VideoPrefetcher:
                     max_frames=args.max_frames,
                     decode_threads=args.decode_threads,
                 )
-                self._q.put((task, tensor, fps, nf, None))
+                item = (task, tensor, fps, nf, None)
             except Exception as exc:
-                self._q.put((task, None, None, None, exc))
-        self._q.put(None)
+                item = (task, None, None, None, exc)
+
+            while not self._stop.is_set():
+                try:
+                    self._q.put(item, timeout=_QUEUE_PUT_TIMEOUT)
+                    break
+                except queue.Full:
+                    continue
+
+        if not self._stop.is_set():
+            # Sentinel — may also block if queue is full and consumer stopped.
+            while not self._stop.is_set():
+                try:
+                    self._q.put(None, timeout=_QUEUE_PUT_TIMEOUT)
+                    break
+                except queue.Full:
+                    continue
+
+    def close(self):
+        """Signal the loader thread to stop and wait for it to exit."""
+        self._stop.set()
+        self._thread.join()
 
     def __iter__(self):
         while True:
@@ -36,3 +60,9 @@ class VideoPrefetcher:
             if item is None:
                 return
             yield item
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()

@@ -37,8 +37,8 @@ class PyramidFlowVAEWrapper(nn.Module):
         pyramid_flow_repo: str,
         vae_checkpoint: str,
         device: str = "cuda:0",
-        use_fp16: bool = True,
-        tile_sample_min_size: int = 256,
+        use_fp16: bool = False,
+        tile_sample_min_size: int = 1280,
         chunk_frames: int = DEFAULT_CHUNK_FRAMES,
     ):
         super().__init__()
@@ -65,8 +65,8 @@ class PyramidFlowVAEWrapper(nn.Module):
         if hasattr(torch, "compile"):
             try:
                 self.vae = torch.compile(self.vae, mode="reduce-overhead", fullgraph=False)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] torch.compile failed, falling back to eager mode: {e}")
 
     def _process_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
         real_frames = chunk.shape[2]
@@ -100,7 +100,7 @@ class PyramidFlowVAEWrapper(nn.Module):
             x_out = decoded.sample if hasattr(decoded, "sample") else decoded
             x_out = x_out[:, :, :real_frames].clamp(-1.0, 1.0)
 
-        x_out = ((x_out + 1.0) / 2.0).to(dtype=torch.float32, device="cpu")
+        x_out = ((x_out + 1.0) / 2.0).to(dtype=torch.float32, device="cpu", non_blocking=True)
         return x_out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -119,11 +119,22 @@ class PyramidFlowVAEWrapper(nn.Module):
                 ).view(1, c, t_out, h, w)
             return out
 
-        result = torch.empty((1, c, total_frames, h, w), dtype=torch.float32, device="cpu")
+        result = None
         for start in range(0, total_frames, chunk_size):
             end = min(start + chunk_size, total_frames)
             chunk = x[:, :, start:end].contiguous()
+            real_chunk_len = end - start
+            # Pad short tail chunk to chunk_size so torch.compile doesn't retrace.
+            if real_chunk_len < chunk_size:
+                pad = chunk_size - real_chunk_len
+                chunk = torch.cat([chunk, chunk[:, :, -1:].expand(-1, -1, pad, -1, -1)], dim=2)
             out_chunk = self._process_chunk(chunk)
+            out_chunk = out_chunk[:, :, :real_chunk_len]
+            if result is None:
+                _, c_out, _, h_out, w_out = out_chunk.shape
+                result = torch.empty(
+                    (1, c_out, total_frames, h_out, w_out), dtype=torch.float32, device="cpu"
+                )
             result[:, :, start:end].copy_(out_chunk)
             del chunk, out_chunk
 

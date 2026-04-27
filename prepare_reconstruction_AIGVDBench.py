@@ -2,6 +2,7 @@ import gc
 import os
 import queue
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -25,7 +26,7 @@ from reconstruction_parser import parse_args
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 """
-cd /media/SSD_4TB/Trends_2025/Project_3/Pitaya-videodet/src
+cd /media/SSD_4TB/Trends_2025/Project_3/recontruct_video
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 PATH="/media/SSD_4TB/Trends_2025/Project_3/local-ffmpeg:$PATH" \
@@ -43,12 +44,11 @@ def collect_paths(input_folder: str) -> list[str]:
         raise ValueError(f"Input folder does not exist or is not a directory: {input_folder}")
 
     paths = []
-    for entry in os.scandir(input_folder):
-        if not entry.is_file():
-            continue
-        if os.path.splitext(entry.name)[1].lower() not in VIDEO_EXTENSIONS:
-            continue
-        paths.append(os.path.abspath(entry.path))
+    for root, _dirs, files in os.walk(input_folder):
+        for name in files:
+            if os.path.splitext(name)[1].lower() not in VIDEO_EXTENSIONS:
+                continue
+            paths.append(os.path.abspath(os.path.join(root, name)))
 
     paths.sort()
     if not paths:
@@ -111,6 +111,66 @@ def ensure_vae_checkpoint_available(args) -> None:
     print(f"[INFO] Using downloaded VAE checkpoint: {args.vae_checkpoint}")
 
 
+def _parse_env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def get_distributed_context(devices: list[str]) -> Optional[dict]:
+    world_size = _parse_env_int("WORLD_SIZE", 1)
+    if world_size <= 1:
+        return None
+
+    local_rank = _parse_env_int("LOCAL_RANK", 0)
+    rank = _parse_env_int("RANK", local_rank)
+
+    if local_rank < 0 or local_rank >= len(devices):
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} is out of range for devices={devices}"
+        )
+
+    return {
+        "world_size": world_size,
+        "rank": rank,
+        "local_rank": local_rank,
+        "device": devices[local_rank],
+    }
+
+
+def _checkpoint_sentinel(checkpoint_path: str) -> str:
+    return os.path.join(checkpoint_path, "_download_complete")
+
+
+def ensure_vae_checkpoint_available_for_rank(args, distributed: Optional[dict]) -> None:
+    if distributed is None or distributed["rank"] == 0:
+        ensure_vae_checkpoint_available(args)
+        # Write a sentinel so non-rank-0 processes know the checkpoint is fully written.
+        if distributed is not None:
+            sentinel = _checkpoint_sentinel(args.vae_checkpoint)
+            with open(sentinel, "w") as f:
+                f.write("")
+        return
+
+    deadline = time.time() + 60 * 30
+    while time.time() < deadline:
+        candidate = os.path.abspath(args.vae_checkpoint)
+        if os.path.isfile(_checkpoint_sentinel(candidate)) and is_valid_vae_checkpoint(candidate):
+            args.vae_checkpoint = candidate
+            print(f"[INFO] Using VAE checkpoint: {args.vae_checkpoint}")
+            return
+        time.sleep(2.0)
+
+    raise TimeoutError(
+        "Timed out waiting for rank 0 to make the VAE checkpoint available at "
+        f"{args.vae_checkpoint}"
+    )
+
+
 def sample_paths(paths: list[str], sample_ratio: float, sample_seed: int) -> list[str]:
     if sample_ratio >= 1.0:
         return paths
@@ -136,10 +196,6 @@ def ensure_matching_video_names(real_path: str, reconstructed_path: str) -> None
             f"{real_name} != {reconstructed_name}"
         )
 
-
-# ---------------------------------------------------------------------------
-# VAE wrapper – now with temporal chunking to bound VRAM
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Per-video processing
@@ -185,19 +241,20 @@ def worker_process(
     tasks: list[VideoTask],
     args,
     progress_queue=None,
+    tqdm_position: int = 0,
 ):
     vae = PyramidFlowVAEWrapper(
         pyramid_flow_repo=args.pyramid_flow_repo,
         vae_checkpoint=args.vae_checkpoint,
         device=device,
-        use_fp16=True,
+        use_fp16=False,
         tile_sample_min_size=args.tile_sample_min_size,
         chunk_frames=args.chunk_frames,
     )
 
     prefetcher = VideoPrefetcher(tasks, args, maxsize=max(1, args.prefetch_queue_size))
 
-    for item in tqdm(prefetcher, total=len(tasks), desc=device, position=0, leave=True):
+    for item in tqdm(prefetcher, total=len(tasks), desc=device, position=tqdm_position, leave=True):
         task, tensor, fps, num_frames, exc = item
         t0 = time.perf_counter()
         if exc is not None:
@@ -319,7 +376,6 @@ def _monitor_workers(processes: list[mp.Process], progress_queue):
 
 def main():
     args = parse_args()
-    ensure_vae_checkpoint_available(args)
 
     try:
         mp.set_start_method("spawn", force=True)
@@ -348,22 +404,43 @@ def main():
     if not devices:
         raise ValueError("No devices provided")
 
+    distributed = get_distributed_context(devices)
+    ensure_vae_checkpoint_available_for_rank(args, distributed)
+
+    if distributed is not None:
+        rank_tasks = tasks[distributed["rank"] :: distributed["world_size"]]
+        print(
+            "[INFO] Accelerate/torchrun launch detected: "
+            f"rank={distributed['rank']} local_rank={distributed['local_rank']} "
+            f"device={distributed['device']} assigned_videos={len(rank_tasks)}"
+        )
+        if rank_tasks:
+            worker_process(distributed["device"], rank_tasks, args, progress_queue=None)
+        return
+
     buckets = chunk_tasks(tasks, devices)
     processes = []
     progress_queue = mp.Queue(maxsize=4096)
-    for device, bucket in zip(devices, buckets):
+    for pos, (device, bucket) in enumerate(zip(devices, buckets)):
         if not bucket:
             continue
         p = mp.Process(
             target=worker_process,
-            args=(device, bucket, args, progress_queue),
+            args=(device, bucket, args, progress_queue, pos),
         )
         p.start()
         processes.append(p)
 
     _monitor_workers(processes, progress_queue)
+    failed = []
     for p in processes:
         p.join()
+        if p.exitcode != 0:
+            failed.append((p.pid, p.exitcode))
+    if failed:
+        for pid, code in failed:
+            print(f"[ERROR] Worker {pid} exited with code {code}")
+        raise RuntimeError(f"{len(failed)} worker(s) failed — see errors above")
 
 
 if __name__ == "__main__":
