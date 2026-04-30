@@ -247,7 +247,7 @@ def worker_process(
         pyramid_flow_repo=args.pyramid_flow_repo,
         vae_checkpoint=args.vae_checkpoint,
         device=device,
-        use_fp16=False,
+        use_fp16=True,
         tile_sample_min_size=args.tile_sample_min_size,
         chunk_frames=args.chunk_frames,
     )
